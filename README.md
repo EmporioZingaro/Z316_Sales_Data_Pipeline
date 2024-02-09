@@ -27,7 +27,7 @@ The Z316 sales data pipeline is architected to capture Tiny ERP webhook notifica
 
 3. **GCS to BQ**: Addition of new files to the `z316-tiny-api` bucket triggers the `gcs_to_bq` Cloud Function. This function is responsible for the transportation of the data into three distinct BigQuery tables: `pdv`, `pesquisa`, and `produto`, each corresponding to the JSON type they represent.
 
-![Data Flow Diagram](https://imgur.com/a/68F45HE)
+![Data Flow Diagram](https://i.imgur.com/xJE8enR.png)
 
 The included diagram visualizes the entire data flow process.
 
