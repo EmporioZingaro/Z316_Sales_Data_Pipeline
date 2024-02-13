@@ -8,13 +8,13 @@ from tenacity import retry, wait_exponential, stop_after_attempt, retry_if_excep
 
 BASE_URL = "https://api.tiny.com.br/api2/"
 FILE_PREFIX = "z316-tiny-api-"
-TARGET_BUCKET_NAME = "z316-test-bucket"
+TARGET_BUCKET_NAME = "z316-tiny-api"
 FOLDER_NAME = "{timestamp}-{dados_id}-{uuid_str}"
 PDV_FILENAME = "{dados_id}-pdv-{timestamp}-{uuid_str}"
 PESQUISA_FILENAME = "{dados_id}-pesquisa-{timestamp}-{uuid_str}"
 PRODUTO_FILENAME = "{dados_id}-produto-{produto_id}-{timestamp}-{uuid_str}"
 SECRET_PATH = "projects/559935551835/secrets/z316-tiny-token-api/versions/latest"
-SLEEP_TIME = 2
+SLEEP_TIME = 3
 
 storage_client = storage.Client()
 secret_manager_client = secretmanager.SecretManagerServiceClient()
@@ -85,26 +85,36 @@ def store_payload(data, filename_template, folder_path):
     except Exception as e:
         print_message(f"Failed to store payload in GCS: {e}")
 
-def is_pedido_processed(dados_id, timestamp):
-    prefix = f"{timestamp}-{dados_id}-"
-    blobs = storage_client.list_blobs(TARGET_BUCKET_NAME, prefix=prefix, max_results=1)
-    return any(blobs)
+def is_pedido_processed_just_in_time(dados_id):
+    search_pattern = f"-{dados_id}-"
+    blobs = storage_client.list_blobs(TARGET_BUCKET_NAME)
+    for blob in blobs:
+        if search_pattern in blob.name:
+            return True
+    return False
 
-def process_pedido(pedido, token):
-    dados_id, data_pedido, pedido_numero = pedido['id'], pedido['data_pedido'], pedido['numero']
-    timestamp, uuid_str = generate_timestamp_and_uuid(data_pedido)
-    folder_path = FOLDER_NAME.format(timestamp=timestamp, dados_id=dados_id, uuid_str=uuid_str)
-
-    if is_pedido_processed(dados_id, timestamp):
-        print_message(f"Pedido {dados_id} already processed. Skipping.")
-        return
-
-    process_pdv_pedido_data(dados_id, timestamp, uuid_str, token, folder_path)
-    process_pedidos_pesquisa_data(dados_id, timestamp, uuid_str, token, pedido_numero, folder_path)
+def fetch_and_extract_dados_ids():
+    all_dados_ids = set()
+    blobs = storage_client.list_blobs(TARGET_BUCKET_NAME)
+    for blob in blobs:
+        parts = blob.name.split('-')
+        if len(parts) > 1:
+            dados_id = parts[1]
+            all_dados_ids.add(dados_id)
+    return all_dados_ids
 
 def generate_timestamp_and_uuid(data_pedido):
     timestamp = datetime.strptime(data_pedido, "%d/%m/%Y").strftime("%Y%m%dT000000")
     return timestamp, str(uuid.uuid4())
+
+def fetch_pdv_pedido_data(dados_id, token):
+    return make_api_call(f"{BASE_URL}pdv.pedido.obter.php?token={token}&id={dados_id}")
+
+def fetch_produto_data(item_id, token):
+    return make_api_call(f"{BASE_URL}produto.obter.php?token={token}&id={item_id}&formato=JSON")
+
+def fetch_pedidos_pesquisa_data(pedido_numero, token):
+    return make_api_call(f"{BASE_URL}pedidos.pesquisa.php?token={token}&numero={pedido_numero}&formato=JSON")
 
 def process_pdv_pedido_data(dados_id, timestamp, uuid_str, token, folder_path):
     pdv_pedido_data = fetch_pdv_pedido_data(dados_id, token)
@@ -120,19 +130,30 @@ def process_pedidos_pesquisa_data(dados_id, timestamp, uuid_str, token, pedido_n
     pedidos_data = fetch_pedidos_pesquisa_data(pedido_numero, token)
     store_payload(pedidos_data, PESQUISA_FILENAME.format(dados_id=dados_id, timestamp=timestamp, uuid_str=uuid_str), folder_path)
 
-def fetch_pdv_pedido_data(dados_id, token):
-    return make_api_call(f"{BASE_URL}pdv.pedido.obter.php?token={token}&id={dados_id}")
+def process_pedido(pedido, all_processed_dados_ids, token):
+    dados_id, data_pedido, pedido_numero = pedido['id'], pedido['data_pedido'], pedido['numero']
 
-def fetch_produto_data(item_id, token):
-    return make_api_call(f"{BASE_URL}produto.obter.php?token={token}&id={item_id}&formato=JSON")
+    if dados_id not in all_processed_dados_ids:
+        if not is_pedido_processed_just_in_time(dados_id):
+            print_message(f"Pedido {dados_id} not found in initial set, but confirmed unprocessed. Proceeding.")
+            timestamp, uuid_str = generate_timestamp_and_uuid(data_pedido)
+            folder_path = FOLDER_NAME.format(timestamp=timestamp, dados_id=dados_id, uuid_str=uuid_str)
 
-def fetch_pedidos_pesquisa_data(pedido_numero, token):
-    return make_api_call(f"{BASE_URL}pedidos.pesquisa.php?token={token}&numero={pedido_numero}&formato=JSON")
+            process_pdv_pedido_data(dados_id, timestamp, uuid_str, token, folder_path)
+            process_pedidos_pesquisa_data(dados_id, timestamp, uuid_str, token, pedido_numero, folder_path)
+
+            all_processed_dados_ids.add(dados_id)
+        else:
+            print_message(f"Pedido {dados_id} confirmed processed on just-in-time check. Skipping.")
+    else:
+        print_message(f"Pedido {dados_id} already processed. Skipping.")
 
 def process_pedidos(page_limit=None):
     token = get_api_token()
     pagina = 1
     numero_paginas = 1
+
+    all_processed_dados_ids = fetch_and_extract_dados_ids()
 
     while pagina <= numero_paginas:
         url = f"{BASE_URL}pedidos.pesquisa.php?token={token}&formato=JSON&pagina={pagina}"
@@ -140,7 +161,7 @@ def process_pedidos(page_limit=None):
         numero_paginas = int(pedidos_data.get('retorno', {}).get('numero_paginas', 1))
 
         for pedido in pedidos_data.get('retorno', {}).get('pedidos', []):
-            process_pedido(pedido['pedido'], token)
+            process_pedido(pedido['pedido'], all_processed_dados_ids, token)
 
         pagina += 1
         if page_limit and pagina > page_limit:
