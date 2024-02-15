@@ -1,6 +1,7 @@
 import json
 import requests
 import uuid
+import hashlib
 import time
 from datetime import datetime
 from google.cloud import storage, secretmanager
@@ -15,6 +16,10 @@ PESQUISA_FILENAME = "{dados_id}-pesquisa-{timestamp}-{uuid_str}"
 PRODUTO_FILENAME = "{dados_id}-produto-{produto_id}-{timestamp}-{uuid_str}"
 SECRET_PATH = "projects/559935551835/secrets/z316-tiny-token-api/versions/latest"
 SLEEP_TIME = 3
+
+PROJECT_ID = "z316-sales-data-pipeline"
+SOURCE_IDENTIFIER = "backfill"
+VERSION_CONTROL = "git_commit_id"
 
 storage_client = storage.Client()
 secret_manager_client = secretmanager.SecretManagerServiceClient()
@@ -76,12 +81,36 @@ class InvalidTokenError(Exception):
 class RetryableError(Exception):
     pass
 
-def store_payload(data, filename_template, folder_path):
+def generate_checksum(data):
+    return hashlib.md5(json.dumps(data, sort_keys=True).encode('utf-8')).hexdigest()
+
+def store_payload(data, filename_template, folder_path, metadata):
     file_path = f"{folder_path}/{FILE_PREFIX}{filename_template}.json"
     print_message(f"Storing payload in GCS at: {file_path}")
+
+    checksum = generate_checksum(data)
+    processing_timestamp = datetime.utcnow().isoformat() + 'Z'
+
+    full_metadata = {
+        'UUID': metadata.get('uuid_str', ''),
+        'Pedido-ID': metadata.get('pedido_id', ''),
+        'Produto-ID': metadata.get('produto_id', ''),
+        'Data-Type': metadata.get('data_type', ''),
+        'Processing-Timestamp': processing_timestamp,
+        'Checksum': checksum,
+        'Project-ID': PROJECT_ID,
+        'Source-Identifier': SOURCE_IDENTIFIER,
+        'Version-Control': VERSION_CONTROL
+    }
+
+    full_metadata = {k: v for k, v in full_metadata.items() if v}
+
     try:
         bucket = storage_client.bucket(TARGET_BUCKET_NAME)
-        bucket.blob(file_path).upload_from_string(json.dumps(data), content_type='application/json')
+        blob = bucket.blob(file_path)
+        blob.metadata = full_metadata
+        blob.upload_from_string(json.dumps(data), content_type='application/json')
+        print_message(f"Payload stored with metadata: {full_metadata}")
     except Exception as e:
         print_message(f"Failed to store payload in GCS: {e}")
 
@@ -118,17 +147,35 @@ def fetch_pedidos_pesquisa_data(pedido_numero, token):
 
 def process_pdv_pedido_data(dados_id, timestamp, uuid_str, token, folder_path):
     pdv_pedido_data = fetch_pdv_pedido_data(dados_id, token)
-    store_payload(pdv_pedido_data, PDV_FILENAME.format(dados_id=dados_id, timestamp=timestamp, uuid_str=uuid_str), folder_path)
+    pedido_numero = pdv_pedido_data.get('retorno', {}).get('pedido', {}).get('numero')
+
+    store_payload(pdv_pedido_data, PDV_FILENAME.format(dados_id=dados_id, timestamp=timestamp, uuid_str=uuid_str), folder_path, {
+        'uuid_str': uuid_str,
+        'pedido_id': pedido_numero,
+        'data_type': 'pdv.pedido'
+    })
 
     for item in pdv_pedido_data.get('retorno', {}).get('pedido', {}).get('itens', []):
         item_id = item.get('idProduto')
         if item_id:
             produto_data = fetch_produto_data(item_id, token)
-            store_payload(produto_data, PRODUTO_FILENAME.format(dados_id=dados_id, produto_id=item_id, timestamp=timestamp, uuid_str=uuid_str), folder_path)
+            store_payload(produto_data, PRODUTO_FILENAME.format(dados_id=dados_id, produto_id=item_id, timestamp=timestamp, uuid_str=uuid_str), folder_path, {
+                'uuid_str': uuid_str,
+                'pedido_id': pedido_numero,
+                'produto_id': item_id,
+                'data_type': 'produto'
+            })
+
+    return pedido_numero
 
 def process_pedidos_pesquisa_data(dados_id, timestamp, uuid_str, token, pedido_numero, folder_path):
     pedidos_data = fetch_pedidos_pesquisa_data(pedido_numero, token)
-    store_payload(pedidos_data, PESQUISA_FILENAME.format(dados_id=dados_id, timestamp=timestamp, uuid_str=uuid_str), folder_path)
+
+    store_payload(pedidos_data, PESQUISA_FILENAME.format(dados_id=dados_id, timestamp=timestamp, uuid_str=uuid_str), folder_path, {
+        'uuid_str': uuid_str,
+        'pedido_id': pedido_numero,
+        'data_type': 'pedidos.pesquisa'
+    })
 
 def process_pedido(pedido, all_processed_dados_ids, token):
     dados_id, data_pedido, pedido_numero = pedido['id'], pedido['data_pedido'], pedido['numero']
@@ -139,7 +186,7 @@ def process_pedido(pedido, all_processed_dados_ids, token):
             timestamp, uuid_str = generate_timestamp_and_uuid(data_pedido)
             folder_path = FOLDER_NAME.format(timestamp=timestamp, dados_id=dados_id, uuid_str=uuid_str)
 
-            process_pdv_pedido_data(dados_id, timestamp, uuid_str, token, folder_path)
+            pedido_numero = process_pdv_pedido_data(dados_id, timestamp, uuid_str, token, folder_path)
             process_pedidos_pesquisa_data(dados_id, timestamp, uuid_str, token, pedido_numero, folder_path)
 
             all_processed_dados_ids.add(dados_id)
