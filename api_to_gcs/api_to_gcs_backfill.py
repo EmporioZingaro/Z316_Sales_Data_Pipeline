@@ -24,6 +24,15 @@ VERSION_CONTROL = "git_commit_id"
 storage_client = storage.Client()
 secret_manager_client = secretmanager.SecretManagerServiceClient()
 
+class ValidationError(Exception):
+    pass
+
+class InvalidTokenError(Exception):
+    pass
+
+class RetryableError(Exception):
+    pass
+
 def print_message(message, context=None):
     print(f"{message} - Context: {context}" if context else message)
 
@@ -71,15 +80,6 @@ def validate_json_payload(json_data):
             raise InvalidTokenError("Token is not valid: " + erro_message)
         else:
             raise RetryableError("Error encountered, will attempt retry: " + erro_message)
-
-class ValidationError(Exception):
-    pass
-
-class InvalidTokenError(Exception):
-    pass
-
-class RetryableError(Exception):
-    pass
 
 def generate_checksum(data):
     return hashlib.md5(json.dumps(data, sort_keys=True).encode('utf-8')).hexdigest()
