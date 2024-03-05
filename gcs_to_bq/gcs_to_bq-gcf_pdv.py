@@ -5,9 +5,10 @@ from datetime import datetime
 from google.cloud import bigquery
 from google.cloud import storage
 from google.cloud.exceptions import NotFound
+from google.cloud.pubsub_v1.publisher.exceptions import TimeoutError, RetryError
+from tenacity import retry, stop_after_attempt, wait_exponential
 
-#DATASET_ID = 'z316_tiny_raw_json'
-DATASET_ID = 'z316_test'
+DATASET_ID = 'z316_tiny_raw_json'
 TABLE_ID = 'pdv'
 FILENAME_PATTERN = r"z316-tiny-api-\d+-(produto|pdv|pesquisa)(-\d+)?-(\d{8}T\d{6})-([a-f0-9-]+)\.json"
 SOURCE = 'cloudfunction-pdv'
@@ -109,7 +110,7 @@ def parse_filename(filename):
         else:
             logging.error(f"Unexpected number of groups found in filename {filename}")
             raise ValueError("Unexpected number of groups in filename.")
-        
+
         timestamp = datetime.strptime(timestamp_str, "%Y%m%dT%H%M%S").isoformat()
         return uuid, timestamp
     else:
@@ -133,6 +134,24 @@ def transform_date_format(date_str):
     except ValueError as e:
         logging.error(f"Error transforming date format: {e}")
         return date_str
+
+@retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=2, min=2, max=60))
+def publish_to_pubsub(uuid):
+    """Publishes a message to a Pub/Sub topic with the client's pedido UUID, with retry logic for retryable errors."""
+    try:
+        publisher = pubsub_v1.PublisherClient()
+        topic_path = publisher.topic_path(PROJECT_ID, TOPIC_ID)
+        message_data = json.dumps({"pedido_uuid": uuid}).encode("utf-8")
+        future = publisher.publish(topic_path, message_data)
+        future.result(timeout=30)
+        logging.info(f"Published message to {TOPIC_ID} with UUID: {uuid}")
+    except TimeoutError:
+        logging.error(f"Timeout occurred while publishing message to {TOPIC_ID} with UUID: {uuid}")
+        raise
+    except RetryError as e:
+        logging.error(f"Max retries reached while publishing message to {TOPIC_ID} with UUID: {uuid}: {e}")
+    except Exception as e:
+        logging.error(f"An unexpected error occurred while publishing message to {TOPIC_ID} with UUID: {uuid}: {e}")
 
 def transform_and_load_data(client, storage_client, bucket_name, filename, uuid, timestamp):
     bucket = storage_client.bucket(bucket_name)
@@ -160,6 +179,7 @@ def transform_and_load_data(client, storage_client, bucket_name, filename, uuid,
         logging.error(f"Errors streaming data to BigQuery: {errors}")
     else:
         logging.info(f"Data streamed successfully to {TABLE_ID}.")
+        publish_to_pubsub(uuid)
 
 def cloud_function_entry_point(event, context):
     if "pdv" not in event['name']:
