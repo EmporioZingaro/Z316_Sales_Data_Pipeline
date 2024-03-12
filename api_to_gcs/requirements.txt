@@ -1,0 +1,6 @@
+requests
+tenacity
+google-cloud-storage
+google-cloud-pubsub 
+google-cloud-secret-manager
+google-cloud-logging
