@@ -15,6 +15,7 @@ SOURCE = os.getenv('SOURCE')
 VERSION = os.getenv('VERSION')
 PROJECT_ID = os.getenv('PROJECT_ID')
 TOPIC_ID = os.getenv('TOPIC_ID')
+NOTIFY = os.getenv('NOTIFY', 'False').lower() == 'true'
 
 logging.basicConfig(level=logging.DEBUG)
 
@@ -262,6 +263,10 @@ def publish_to_pubsub(uuid: str) -> None:
         TimeoutError: If a timeout occurs while publishing the message.
         RetryError: If the maximum number of retries is reached.
     """
+    if not NOTIFY:
+        logging.info(f"Notification disabled. Skipping publishing message to {TOPIC_ID} with UUID: {uuid}")
+        return
+
     try:
         publisher = pubsub_v1.PublisherClient()
         topic_path = publisher.topic_path(PROJECT_ID, TOPIC_ID)
@@ -315,7 +320,8 @@ def transform_and_load_pdv_data(client: bigquery.Client, storage_client: storage
         logging.error(f"Errors streaming data to BigQuery: {errors}")
     else:
         logging.info(f"Data streamed successfully to pdv.")
-        publish_to_pubsub(uuid)
+        if NOTIFY:
+            publish_to_pubsub(uuid)
 
 
 def transform_and_load_pesquisa_data(client: bigquery.Client, storage_client: storage.Client, bucket_name: str, filename: str, uuid: str, timestamp: str) -> None:
@@ -350,12 +356,14 @@ def transform_and_load_pesquisa_data(client: bigquery.Client, storage_client: st
             'update_timestamp': datetime.utcnow().isoformat()
         })
 
-        table_ref = client.dataset(DATASET_ID).table('pesquisa')
+        table_ref = client.dataset(DATASET_ID).table('pesquisa'
         errors = client.insert_rows_json(table_ref, [pedido_data])
         if errors:
             logging.error(f"Errors streaming data to BigQuery: {errors}")
         else:
             logging.info(f"Data streamed successfully to pesquisa.")
+            if NOTIFY:
+                publish_to_pubsub(uuid)
 
 
 def transform_and_load_produto_data(client: bigquery.Client, storage_client: storage.Client, bucket_name: str, filename: str, uuid: str, timestamp: str) -> None:
@@ -382,12 +390,14 @@ def transform_and_load_produto_data(client: bigquery.Client, storage_client: sto
         'update_timestamp': datetime.utcnow().isoformat()
     })
 
-    table_ref = client.dataset(DATASET_ID).table('produto')
+    table_ref = client.dataset(DATASET_ID).table('produto'
     errors = client.insert_rows_json(table_ref, [produto_data])
     if errors:
         logging.error(f"Errors streaming data to BigQuery: {errors}")
     else:
         logging.info(f"Data streamed successfully to produto.")
+        if NOTIFY:
+            publish_to_pubsub(uuid)
 
 
 def cloud_function_entry_point(event: dict, context: Any) -> None:
