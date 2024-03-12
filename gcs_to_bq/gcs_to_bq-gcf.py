@@ -1,6 +1,7 @@
 import json
 import logging
 import re
+import os
 from datetime import datetime
 
 from google.cloud import bigquery, storage
@@ -8,12 +9,13 @@ from google.cloud.exceptions import NotFound
 from google.cloud.pubsub_v1.publisher.exceptions import RetryError, TimeoutError
 from tenacity import retry, stop_after_attempt, wait_exponential
 
-DATASET_ID = 'z316_test'
-FILENAME_PATTERN = r"z316-tiny-api-\d+-(produto|pdv|pesquisa)(-\d+)?-(\d{8}T\d{6})-([a-f0-9-]+)\.json"
-SOURCE = 'cloudfunction'
-VERSION = 'v2'
-PROJECT_ID =
-TOPIC_ID =
+DATASET_ID = os.getenv('DATASET_ID')
+FILENAME_PATTERN = os.getenv('FILENAME_PATTERN')
+SOURCE = os.getenv('SOURCE')
+VERSION = os.getenv('VERSION')
+PROJECT_ID = os.getenv('PROJECT_ID')
+TOPIC_ID = os.getenv('TOPIC_ID')
+
 logging.basicConfig(level=logging.DEBUG)
 
 PDV_SCHEMA =[
@@ -179,7 +181,19 @@ PRODUTO_SCHEMA SCHEMA = [
 ]
 
 
-def parse_filename(filename):
+def parse_filename(filename: str) -> Tuple[str, str, str]:
+    """
+    Parse the filename to extract the UUID, timestamp, and product type.
+
+    Args:
+        filename (str): The name of the file to parse.
+
+    Returns:
+        Tuple[str, str, str]: A tuple containing the UUID, timestamp, and product type.
+
+    Raises:
+        ValueError: If the filename does not match the expected pattern or contains an unexpected number of groups.
+    """
     match = re.search(FILENAME_PATTERN, filename)
     if not match:
         logging.error(f"Error parsing filename {filename}: Filename does not match expected pattern.")
@@ -198,7 +212,15 @@ def parse_filename(filename):
     return uuid, timestamp, product_type
 
 
-def ensure_table_exists(client, table_id, schema):
+def ensure_table_exists(client: bigquery.Client, table_id: str, schema: List[bigquery.SchemaField]) -> None:
+    """
+    Ensure that the specified BigQuery table exists, creating it if necessary.
+
+    Args:
+        client (bigquery.Client): The BigQuery client.
+        table_id (str): The ID of the table to check or create.
+        schema (List[bigquery.SchemaField]): The schema of the table.
+    """
     dataset_ref = client.dataset(DATASET_ID)
     table_ref = dataset_ref.table(table_id)
     try:
@@ -211,7 +233,16 @@ def ensure_table_exists(client, table_id, schema):
         logging.info(f"Table {table_id} created with day-partitioning on 'timestamp'.")
 
 
-def transform_date_format(date_str):
+def transform_date_format(date_str: str) -> str:
+    """
+    Transform the date format from "dd/mm/yyyy" to "yyyy-mm-dd".
+
+    Args:
+        date_str (str): The date string to transform.
+
+    Returns:
+        str: The transformed date string, or the original string if the transformation fails.
+    """
     try:
         return datetime.strptime(date_str, "%d/%m/%Y").strftime("%Y-%m-%d")
     except ValueError as e:
@@ -220,8 +251,17 @@ def transform_date_format(date_str):
 
 
 @retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=2, min=2, max=60))
-def publish_to_pubsub(uuid):
-    """Publishes a message to a Pub/Sub topic with the client's pedido UUID, with retry logic for retryable errors."""
+def publish_to_pubsub(uuid: str) -> None:
+    """
+    Publish a message to a Pub/Sub topic with the client's pedido UUID, with retry logic for retryable errors.
+
+    Args:
+        uuid (str): The UUID of the pedido.
+
+    Raises:
+        TimeoutError: If a timeout occurs while publishing the message.
+        RetryError: If the maximum number of retries is reached.
+    """
     try:
         publisher = pubsub_v1.PublisherClient()
         topic_path = publisher.topic_path(PROJECT_ID, TOPIC_ID)
@@ -238,7 +278,18 @@ def publish_to_pubsub(uuid):
         logging.error(f"An unexpected error occurred while publishing message to {TOPIC_ID} with UUID: {uuid}: {e}")
 
 
-def transform_and_load_pdv_data(client, storage_client, bucket_name, filename, uuid, timestamp):
+def transform_and_load_pdv_data(client: bigquery.Client, storage_client: storage.Client, bucket_name: str, filename: str, uuid: str, timestamp: str) -> None:
+    """
+    Transform and load PDV data into BigQuery.
+
+    Args:
+        client (bigquery.Client): The BigQuery client.
+        storage_client (storage.Client): The Google Cloud Storage client.
+        bucket_name (str): The name of the bucket containing the file.
+        filename (str): The name of the file to process.
+        uuid (str): The UUID of the pedido.
+        timestamp (str): The timestamp of the pedido.
+    """
     bucket = storage_client.bucket(bucket_name)
     blob = bucket.blob(filename)
     json_content = json.loads(blob.download_as_text())
@@ -267,7 +318,18 @@ def transform_and_load_pdv_data(client, storage_client, bucket_name, filename, u
         publish_to_pubsub(uuid)
 
 
-def transform_and_load_pesquisa_data(client, storage_client, bucket_name, filename, uuid, timestamp):
+def transform_and_load_pesquisa_data(client: bigquery.Client, storage_client: storage.Client, bucket_name: str, filename: str, uuid: str, timestamp: str) -> None:
+    """
+    Transform and load Pesquisa data into BigQuery.
+
+    Args:
+        client (bigquery.Client): The BigQuery client.
+        storage_client (storage.Client): The Google Cloud Storage client.
+        bucket_name (str): The name of the bucket containing the file.
+        filename (str): The name of the file to process.
+        uuid (str): The UUID of the pedido.
+        timestamp (str): The timestamp of the pedido.
+    """
     bucket = storage_client.bucket(bucket_name)
     blob = bucket.blob(filename)
     json_content = json.loads(blob.download_as_text())
@@ -296,7 +358,18 @@ def transform_and_load_pesquisa_data(client, storage_client, bucket_name, filena
             logging.info(f"Data streamed successfully to pesquisa.")
 
 
-def transform_and_load_produto_data(client, storage_client, bucket_name, filename, uuid, timestamp):
+def transform_and_load_produto_data(client: bigquery.Client, storage_client: storage.Client, bucket_name: str, filename: str, uuid: str, timestamp: str) -> None:
+    """
+    Transform and load Produto data into BigQuery.
+
+    Args:
+        client (bigquery.Client): The BigQuery client.
+        storage_client (storage.Client): The Google Cloud Storage client.
+        bucket_name (str): The name of the bucket containing the file.
+        filename (str): The name of the file to process.
+        uuid (str): The UUID of the produto.
+        timestamp (str): The timestamp of the produto.
+    """
     bucket = storage_client.bucket(bucket_name)
     blob = bucket.blob(filename)
     json_content = json.loads(blob.download_as_text())
@@ -317,7 +390,14 @@ def transform_and_load_produto_data(client, storage_client, bucket_name, filenam
         logging.info(f"Data streamed successfully to produto.")
 
 
-def cloud_function_entry_point(event, context):
+def cloud_function_entry_point(event: dict, context: Any) -> None:
+    """
+    The entry point for the Cloud Function.
+
+    Args:
+        event (dict): The event payload.
+        context (Any): The event context.
+    """
     client = bigquery.Client()
     storage_client = storage.Client()
     uuid, timestamp, product_type = parse_filename(event['name'])
