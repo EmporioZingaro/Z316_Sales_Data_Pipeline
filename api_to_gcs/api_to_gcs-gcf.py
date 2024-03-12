@@ -3,6 +3,7 @@ import requests
 import hashlib
 import os
 from datetime import datetime
+from typing import Optional, Any, Tuple
 
 from google.cloud import storage, secretmanager
 from google.cloud import pubsub_v1
@@ -22,6 +23,7 @@ VERSION_CONTROL = os.environ['VERSION_CONTROL']
 PUBSUB_TOPIC = os.environ['PUBSUB_TOPIC']
 
 storage_client = storage.Client()
+publisher = pubsub_v1.PublisherClient()
 secret_manager_client = secretmanager.SecretManagerServiceClient()
 
 class ValidationError(Exception):
@@ -357,7 +359,6 @@ def publish_notification(topic_path: str, message: str) -> None:
         message (str): The message to publish.
     """
     try:
-        topic_path = publisher.topic_path(PROJECT_ID, topic_path)
         future = publisher.publish(topic_path, data=message.encode('utf-8'))
         print_message(f"Notification published to {topic_path} with message: {message}")
         future.result()
