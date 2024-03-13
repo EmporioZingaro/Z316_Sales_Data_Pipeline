@@ -4,6 +4,7 @@ import hashlib
 import os
 from datetime import datetime
 from typing import Optional, Any, Tuple
+import logging
 
 from google.cloud import storage, secretmanager
 from google.cloud import pubsub_v1
@@ -26,6 +27,9 @@ storage_client = storage.Client()
 publisher = pubsub_v1.PublisherClient()
 secret_manager_client = secretmanager.SecretManagerServiceClient()
 
+logging.basicConfig(level=logging.DEBUG)
+logger = logging.getLogger(__name__)
+
 class ValidationError(Exception):
     pass
 
@@ -36,17 +40,6 @@ class InvalidTokenError(Exception):
 
 class RetryableError(Exception):
     pass
-
-
-def print_message(message: str, context: Optional[dict] = None) -> None:
-    """
-    Prints a message with optional context information.
-
-    Args:
-        message (str): The message to be printed.
-        context (Optional[dict]): Additional context information. Defaults to None.
-    """
-    print(f"{message} - Context: {context}" if context else message)
 
 
 def get_api_token() -> str:
@@ -60,11 +53,11 @@ def get_api_token() -> str:
         Exception: If there is an error accessing the secret.
     """
     try:
-        print_message("Accessing API token from Secret Manager")
+        logger.debug("Accessing API token from Secret Manager")
         response = secret_manager_client.access_secret_version(request={"name": SECRET_PATH})
         return response.payload.data.decode("UTF-8")
     except Exception as e:
-        print_message(f"Failed to access secret: {e}")
+        logger.exception(f"Failed to access secret: {e}")
         raise
 
 
@@ -85,7 +78,7 @@ def make_api_call(url: str) -> dict:
     """
     try:
         sanitized_url = url.split('?token=')[0]
-        print_message(f"Making API call to: {sanitized_url}")
+        logger.debug(f"Making API call to: {sanitized_url}")
         response = requests.get(url)
         response.raise_for_status()
         json_data = response.json()
@@ -94,10 +87,10 @@ def make_api_call(url: str) -> dict:
 
         return json_data
     except requests.exceptions.RequestException as e:
-        print_message(f"API request failed: {e}")
+        logger.exception(f"API request failed: {e}")
         raise
     except ValidationError as e:
-        print_message(f"Payload validation failed: {e}")
+        logger.exception(f"Payload validation failed: {e}")
         raise
 
 
@@ -144,36 +137,35 @@ def read_webhook_payload(bucket_name: str, file_name: str) -> dict:
         Exception: If there is an error reading the webhook payload.
     """
     try:
+        logger.debug(f"Reading webhook payload from bucket: {bucket_name}, file: {file_name}")
         bucket = storage_client.bucket(bucket_name)
         blob = bucket.blob(file_name)
         return json.loads(blob.download_as_string(client=None))
     except Exception as e:
-        print_message(f"Failed to read webhook payload: {e}")
+        logger.exception(f"Failed to read webhook payload: {e}")
         raise
 
 
 def process_webhook_payload(event: dict, context: Any) -> None:
     """
     Processes the webhook payload received from the event.
-
     Args:
         event (dict): The event containing the webhook payload.
         context (Any): The context of the event.
     """
-    print_message("Function execution started", context={'event_id': context.event_id})
+    logger.info(f"Function execution started - Context: {context.event_id}")
     try:
         payload_details = extract_payload_details(event)
         if not payload_details:
             return
-
         token = get_api_token()
-        pedido_numero = process_pdv_pedido_data(*payload_details, token)
-        process_pedidos_pesquisa_data(*payload_details, token, pedido_numero)
-        publish_notification(PUBSUB_TOPIC, payload_details[2])
-
+        pdv_pedido_data, pedido_numero = process_pdv_pedido_data(*payload_details, token)
+        pedidos_pesquisa_data = process_pedidos_pesquisa_data(*payload_details, token, pdv_pedido_data)
+        consolidated_payload = consolidate_payloads(pdv_pedido_data, pedidos_pesquisa_data, token)
+        publish_notification(PUBSUB_TOPIC, pdv_pedido_data, consolidated_payload['produto_data'], pedidos_pesquisa_data)
     except Exception as e:
-        print_message(f"Function failed: {e}", context={'event_id': context.event_id})
-    print_message("Function execution completed successfully", context={'event_id': context.event_id})
+        logger.exception(f"Function failed: {e} - Context: {context.event_id}")
+    logger.info(f"Function execution completed successfully - Context: {context.event_id}")
 
 
 def extract_payload_details(event: dict) -> Optional[Tuple[str, str, str]]:
@@ -192,26 +184,25 @@ def extract_payload_details(event: dict) -> Optional[Tuple[str, str, str]]:
     dados_id = webhook_payload.get('dados', {}).get('id')
 
     if not dados_id:
-        print_message("dados.id not found in webhook payload")
+        logger.warning("dados.id not found in webhook payload")
         return None
 
     parts = file_name.rstrip('.json').split('-')
     return dados_id, parts[-6], '-'.join(parts[-5:])
 
 
-def process_pdv_pedido_data(dados_id: str, timestamp: str, uuid_str: str, token: str) -> str:
+def process_pdv_pedido_data(dados_id: str, timestamp: str, uuid_str: str, token: str) -> Tuple[dict, str]:
     """
     Processes the PDV pedido data.
-
     Args:
         dados_id (str): The dados_id.
         timestamp (str): The timestamp.
         uuid_str (str): The UUID string.
         token (str): The API token.
-
     Returns:
-        str: The pedido_numero.
+        Tuple[dict, str]: A tuple containing the PDV pedido data and the pedido_numero.
     """
+    logger.debug(f"Processing PDV pedido data - dados_id: {dados_id}, timestamp: {timestamp}, uuid_str: {uuid_str}")
     folder_path = FOLDER_NAME.format(timestamp=timestamp, dados_id=dados_id, uuid_str=uuid_str)
     pdv_pedido_data = fetch_pdv_pedido_data(dados_id, token)
     pedido_numero = pdv_pedido_data.get('retorno', {}).get('pedido', {}).get('numero')
@@ -220,7 +211,6 @@ def process_pdv_pedido_data(dados_id: str, timestamp: str, uuid_str: str, token:
         'pedido_id': pedido_numero,
         'data_type': 'pdv.pedido'
     })
-
     for item in pdv_pedido_data.get('retorno', {}).get('pedido', {}).get('itens', []):
         item_id = item.get('idProduto')
         if item_id:
@@ -231,8 +221,7 @@ def process_pdv_pedido_data(dados_id: str, timestamp: str, uuid_str: str, token:
                 'produto_id': item_id,
                 'data_type': 'produto'
             })
-
-    return pedido_numero
+    return pdv_pedido_data, pedido_numero
 
 
 def process_pedidos_pesquisa_data(dados_id: str, timestamp: str, uuid_str: str, token: str, pedido_numero: str) -> None:
@@ -246,6 +235,7 @@ def process_pedidos_pesquisa_data(dados_id: str, timestamp: str, uuid_str: str, 
         token (str): The API token.
         pedido_numero (str): The pedido_numero.
     """
+    logger.debug(f"Processing pedidos pesquisa data - dados_id: {dados_id}, timestamp: {timestamp}, uuid_str: {uuid_str}, pedido_numero: {pedido_numero}")
     folder_path = FOLDER_NAME.format(timestamp=timestamp, dados_id=dados_id, uuid_str=uuid_str)
     pedidos_data = fetch_pedidos_pesquisa_data(pedido_numero, token)
     store_payload(pedidos_data, PESQUISA_FILENAME.format(dados_id=dados_id, timestamp=timestamp, uuid_str=uuid_str), folder_path, {
@@ -266,6 +256,7 @@ def fetch_pdv_pedido_data(dados_id: str, token: str) -> dict:
     Returns:
         dict: The PDV pedido data.
     """
+    logger.debug(f"Fetching PDV pedido data - dados_id: {dados_id}")
     return make_api_call(f"{BASE_URL}pdv.pedido.obter.php?token={token}&id={dados_id}")
 
 
@@ -280,6 +271,7 @@ def fetch_produto_data(item_id: str, token: str) -> dict:
     Returns:
         dict: The produto data.
     """
+    logger.debug(f"Fetching produto data - item_id: {item_id}")
     return make_api_call(f"{BASE_URL}produto.obter.php?token={token}&id={item_id}&formato=JSON")
 
 
@@ -294,6 +286,7 @@ def fetch_pedidos_pesquisa_data(pedido_numero: str, token: str) -> dict:
     Returns:
         dict: The pedidos pesquisa data.
     """
+    logger.debug(f"Fetching pedidos pesquisa data - pedido_numero: {pedido_numero}")
     return make_api_call(f"{BASE_URL}pedidos.pesquisa.php?token={token}&numero={pedido_numero}&formato=JSON")
 
 
@@ -307,6 +300,7 @@ def generate_checksum(data: dict) -> str:
     Returns:
         str: The generated checksum.
     """
+    logger.debug("Generating checksum")
     return hashlib.md5(json.dumps(data, sort_keys=True).encode('utf-8')).hexdigest()
 
 
@@ -321,7 +315,7 @@ def store_payload(data: dict, filename_template: str, folder_path: str, metadata
         metadata (dict): Additional metadata to store with the payload.
     """
     file_path = f"{folder_path}/{FILE_PREFIX}{filename_template}.json"
-    print_message(f"Storing payload in GCS at: {file_path}")
+    logger.debug(f"Storing payload in GCS at: {file_path}")
 
     checksum = generate_checksum(data)
     processing_timestamp = datetime.utcnow().isoformat() + 'Z'
@@ -345,22 +339,49 @@ def store_payload(data: dict, filename_template: str, folder_path: str, metadata
         blob = bucket.blob(file_path)
         blob.metadata = full_metadata
         blob.upload_from_string(json.dumps(data), content_type='application/json')
-        print_message(f"Payload stored with metadata: {full_metadata}")
+        logger.debug(f"Payload stored with metadata: {full_metadata}")
     except Exception as e:
-        print_message(f"Failed to store payload in GCS: {e}")
+        logger.exception(f"Failed to store payload in GCS: {e}")
 
 
-def publish_notification(topic_path: str, message: str) -> None:
+def consolidate_payloads(pdv_pedido_data: dict, pedidos_pesquisa_data: dict) -> dict:
+    """
+    Consolidates the PDV pedido data, produto data, and pedidos pesquisa data into a single payload.
+    Args:
+        pdv_pedido_data (dict): The PDV pedido data.
+        pedidos_pesquisa_data (dict): The pedidos pesquisa data.
+    Returns:
+        dict: The consolidated payload.
+    """
+    logger.debug("Consolidating payloads")
+    produto_data = pdv_pedido_data.get('retorno', {}).get('pedido', {}).get('itens', [])
+
+    consolidated_payload = {
+        'pdv_pedido_data': pdv_pedido_data,
+        'produto_data': produto_data,
+        'pedidos_pesquisa_data': pedidos_pesquisa_data
+    }
+    return consolidated_payload
+
+
+def publish_notification(topic_path: str, pdv_pedido_data: dict, produto_data: dict, pedidos_pesquisa_data: dict) -> None:
     """
     Publishes a notification message to the specified Pub/Sub topic.
-
     Args:
         topic_path (str): The path of the Pub/Sub topic.
-        message (str): The message to publish.
+        pdv_pedido_data (dict): The PDV pedido data.
+        produto_data (dict): The produto data.
+        pedidos_pesquisa_data (dict): The pedidos pesquisa data.
     """
     try:
-        future = publisher.publish(topic_path, data=message.encode('utf-8'))
-        print_message(f"Notification published to {topic_path} with message: {message}")
+        message = {
+            'pdv_pedido_data': pdv_pedido_data,
+            'produto_data': produto_data,
+            'pedidos_pesquisa_data': pedidos_pesquisa_data
+        }
+        payload = json.dumps(message)
+        future = publisher.publish(topic_path, data=payload.encode('utf-8'))
+        logger.info(f"Notification published to {topic_path} with payload: {payload}")
         future.result()
     except Exception as e:
-        print_message(f"Failed to publish notification: {e}")
+        logger.exception(f"Failed to publish notification: {e}")
