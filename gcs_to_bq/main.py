@@ -1,23 +1,25 @@
-import json
-import logging
 import re
 import os
+import json
+import base64
+import logging
 from datetime import datetime
+from typing import Any, Dict, List, Tuple, Optional
 
+from google.cloud import pubsub_v1
 from google.cloud import bigquery, storage
 from google.cloud.exceptions import NotFound
-from google.cloud.pubsub_v1.publisher.exceptions import RetryError, TimeoutError
-from tenacity import retry, stop_after_attempt, wait_exponential
+from google.api_core import retry, exceptions
+from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type
 
 DATASET_ID = os.getenv('DATASET_ID')
-FILENAME_PATTERN = os.getenv('FILENAME_PATTERN')
 SOURCE = os.getenv('SOURCE')
 VERSION = os.getenv('VERSION')
 PROJECT_ID = os.getenv('PROJECT_ID')
 TOPIC_ID = os.getenv('TOPIC_ID')
 NOTIFY = os.getenv('NOTIFY', 'False').lower() == 'true'
 
-logging.basicConfig(level=logging.DEBUG)
+logging.basicConfig(level=logging.INFO)
 
 PDV_SCHEMA =[
     bigquery.SchemaField("uuid", "STRING"),
@@ -98,7 +100,7 @@ PDV_SCHEMA =[
 ]
 
 
-PESQUISA_SCHEMA = [
+PESQUISA_SCHEMA =[
     bigquery.SchemaField("uuid", "STRING"),
     bigquery.SchemaField("timestamp", "TIMESTAMP"),
     bigquery.SchemaField("id", "STRING"),
@@ -118,7 +120,7 @@ PESQUISA_SCHEMA = [
 ]
 
 
-PRODUTO_SCHEMA SCHEMA = [
+PRODUTO_SCHEMA =[
     bigquery.SchemaField("uuid", "STRING"),
     bigquery.SchemaField("timestamp", "TIMESTAMP"),
     bigquery.SchemaField("id", "INTEGER"),
@@ -181,127 +183,87 @@ PRODUTO_SCHEMA SCHEMA = [
     bigquery.SchemaField("update_timestamp", "TIMESTAMP"),
 ]
 
-
-def parse_filename(filename: str) -> Tuple[str, str, str]:
-    """
-    Parse the filename to extract the UUID, timestamp, and product type.
-
-    Args:
-        filename (str): The name of the file to parse.
-
-    Returns:
-        Tuple[str, str, str]: A tuple containing the UUID, timestamp, and product type.
-
-    Raises:
-        ValueError: If the filename does not match the expected pattern or contains an unexpected number of groups.
-    """
-    match = re.search(FILENAME_PATTERN, filename)
-    if not match:
-        logging.error(f"Error parsing filename {filename}: Filename does not match expected pattern.")
-        raise ValueError("Filename does not match expected pattern.")
-
-    groups = match.groups()
-    if len(groups) == 5:
-        _, product_type, _, timestamp_str, uuid = groups
-    elif len(groups) == 4:
-        _, product_type, timestamp_str, uuid = groups
-    else:
-        logging.error(f"Unexpected number of groups found in filename {filename}")
-        raise ValueError("Unexpected number of groups in filename.")
-
-    timestamp = datetime.strptime(timestamp_str, "%Y%m%dT%H%M%S").isoformat()
-    return uuid, timestamp, product_type
+DATA_TYPE_MAPPING = {
+    'pedidos.pesquisa': {'table_name': 'pesquisa', 'schema': PESQUISA_SCHEMA},
+    'pdv.pedido': {'table_name': 'pdv', 'schema': PDV_SCHEMA},
+    'produto': {'table_name': 'produto', 'schema': PRODUTO_SCHEMA}
+}
 
 
 def ensure_table_exists(client: bigquery.Client, table_id: str, schema: List[bigquery.SchemaField]) -> None:
-    """
-    Ensure that the specified BigQuery table exists, creating it if necessary.
-
-    Args:
-        client (bigquery.Client): The BigQuery client.
-        table_id (str): The ID of the table to check or create.
-        schema (List[bigquery.SchemaField]): The schema of the table.
-    """
-    dataset_ref = client.dataset(DATASET_ID)
+    logging.debug(f"Checking if table {table_id} exists")
+    dataset_ref = client.dataset(DATASET_ID, project=PROJECT_ID)
     table_ref = dataset_ref.table(table_id)
     try:
         client.get_table(table_ref)
         logging.debug(f"Table {table_id} already exists.")
     except NotFound:
+        logging.info(f"Table {table_id} does not exist. Creating table with day-partitioning on 'timestamp'.")
         table = bigquery.Table(table_ref, schema=schema)
         table.time_partitioning = bigquery.TimePartitioning(field="timestamp")
         client.create_table(table)
-        logging.info(f"Table {table_id} created with day-partitioning on 'timestamp'.")
+        logging.info(f"Table {table_id} created successfully.")
+
+
+def log_bigquery_reference(client: bigquery.Client, dataset_id: str, table_id: str) -> None:
+    full_table_id = f"{client.project}.{dataset_id}.{table_id}"
+    logging.info(f"BigQuery table reference: {full_table_id}")
 
 
 def transform_date_format(date_str: str) -> str:
-    """
-    Transform the date format from "dd/mm/yyyy" to "yyyy-mm-dd".
-
-    Args:
-        date_str (str): The date string to transform.
-
-    Returns:
-        str: The transformed date string, or the original string if the transformation fails.
-    """
+    logging.debug(f"Transforming date format for: {date_str}")
     try:
-        return datetime.strptime(date_str, "%d/%m/%Y").strftime("%Y-%m-%d")
+        transformed_date = datetime.strptime(date_str, "%d/%m/%Y").strftime("%Y-%m-%d")
+        logging.debug(f"Transformed date: {transformed_date}")
+        return transformed_date
     except ValueError as e:
         logging.warning(f"Error transforming date format: {e}")
         return date_str
 
 
-@retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=2, min=2, max=60))
+@retry(retry=retry_if_exception_type(exceptions.DeadlineExceeded), wait=wait_exponential(multiplier=1, min=4, max=60), stop=stop_after_attempt(3))
 def publish_to_pubsub(uuid: str) -> None:
-    """
-    Publish a message to a Pub/Sub topic with the client's pedido UUID, with retry logic for retryable errors.
-
-    Args:
-        uuid (str): The UUID of the pedido.
-
-    Raises:
-        TimeoutError: If a timeout occurs while publishing the message.
-        RetryError: If the maximum number of retries is reached.
-    """
     if not NOTIFY:
         logging.info(f"Notification disabled. Skipping publishing message to {TOPIC_ID} with UUID: {uuid}")
         return
-
     try:
+        logging.info(f"Publishing message to {TOPIC_ID} with UUID: {uuid}")
         publisher = pubsub_v1.PublisherClient()
         topic_path = publisher.topic_path(PROJECT_ID, TOPIC_ID)
         message_data = json.dumps({"pedido_uuid": uuid}).encode("utf-8")
         future = publisher.publish(topic_path, message_data)
         future.result(timeout=30)
         logging.info(f"Published message to {TOPIC_ID} with UUID: {uuid}")
-    except TimeoutError:
+    except exceptions.DeadlineExceeded:
         logging.error(f"Timeout occurred while publishing message to {TOPIC_ID} with UUID: {uuid}")
         raise
-    except RetryError as e:
-        logging.error(f"Max retries reached while publishing message to {TOPIC_ID} with UUID: {uuid}: {e}")
     except Exception as e:
         logging.error(f"An unexpected error occurred while publishing message to {TOPIC_ID} with UUID: {uuid}: {e}")
 
 
-def transform_and_load_pdv_data(client: bigquery.Client, storage_client: storage.Client, bucket_name: str, filename: str, uuid: str, timestamp: str) -> None:
-    """
-    Transform and load PDV data into BigQuery.
+@retry(retry=retry_if_exception_type(exceptions.ServerError), wait=wait_exponential(multiplier=1, min=4, max=60), stop=stop_after_attempt(3))
+def insert_rows_with_retry(client: bigquery.Client, table_ref: bigquery.TableReference, rows: List[Dict[str, Any]]) -> None:
+    logging.info(f"Inserting {len(rows)} rows into {table_ref.table_id}")
+    try:
+        errors = client.insert_rows_json(table_ref, rows)
+        if errors:
+            logging.error(f"Errors streaming data to BigQuery: {errors}")
+        else:
+            logging.info(f"Data streamed successfully to {table_ref.table_id}.")
+    except exceptions.ServerError as e:
+        logging.error(f"Server error occurred while inserting rows to {table_ref.table_id}: {e}")
+        raise
 
-    Args:
-        client (bigquery.Client): The BigQuery client.
-        storage_client (storage.Client): The Google Cloud Storage client.
-        bucket_name (str): The name of the bucket containing the file.
-        filename (str): The name of the file to process.
-        uuid (str): The UUID of the pedido.
-        timestamp (str): The timestamp of the pedido.
-    """
-    bucket = storage_client.bucket(bucket_name)
-    blob = bucket.blob(filename)
-    json_content = json.loads(blob.download_as_text())
-    pedido_data = json_content['retorno']['pedido']
+
+def transform_and_load_pdv_data(client: bigquery.Client, pdv_data: dict, uuid: str, timestamp: str) -> None:
+    logging.info("Transforming and loading PDV data.")
+    ensure_table_exists(client, 'pdv', PDV_SCHEMA)
+
+    pedido_data = pdv_data['retorno']['pedido']
 
     if 'data' in pedido_data:
         pedido_data['data'] = transform_date_format(pedido_data['data'])
+
     if 'parcelas' in pedido_data:
         for parcela in pedido_data['parcelas']:
             if 'dataVencimento' in parcela:
@@ -309,117 +271,102 @@ def transform_and_load_pdv_data(client: bigquery.Client, storage_client: storage
 
     pedido_data.update({
         'uuid': uuid,
-        'timestamp': datetime.strptime(timestamp, "%Y-%m-%dT%H:%M:%S").isoformat(),
+        'timestamp': datetime.strptime(timestamp, "%Y%m%dT%H%M%S").isoformat(),
         'source_id': f"{SOURCE}-pdv_{VERSION}",
         'update_timestamp': datetime.utcnow().isoformat()
     })
 
+    log_bigquery_reference(client, DATASET_ID, 'pdv')
+
     table_ref = client.dataset(DATASET_ID).table('pdv')
-    errors = client.insert_rows_json(table_ref, [pedido_data])
-    if errors:
-        logging.error(f"Errors streaming data to BigQuery: {errors}")
-    else:
-        logging.info(f"Data streamed successfully to pdv.")
-        if NOTIFY:
-            publish_to_pubsub(uuid)
+    insert_rows_with_retry(client, table_ref, [pedido_data])
+
+    if NOTIFY:
+        publish_to_pubsub(uuid)
+
+    logging.info("PDV data transformation and loading completed.")
 
 
-def transform_and_load_pesquisa_data(client: bigquery.Client, storage_client: storage.Client, bucket_name: str, filename: str, uuid: str, timestamp: str) -> None:
-    """
-    Transform and load Pesquisa data into BigQuery.
+def transform_and_load_pesquisa_data(client: bigquery.Client, pesquisa_data: dict, uuid: str, timestamp: str) -> None:
+    logging.info("Transforming and loading Pesquisa data.")
+    ensure_table_exists(client, 'pesquisa', PESQUISA_SCHEMA)
 
-    Args:
-        client (bigquery.Client): The BigQuery client.
-        storage_client (storage.Client): The Google Cloud Storage client.
-        bucket_name (str): The name of the bucket containing the file.
-        filename (str): The name of the file to process.
-        uuid (str): The UUID of the pedido.
-        timestamp (str): The timestamp of the pedido.
-    """
-    bucket = storage_client.bucket(bucket_name)
-    blob = bucket.blob(filename)
-    json_content = json.loads(blob.download_as_text())
-    pedidos_data = json_content['retorno']['pedidos']
-
-    for pedido in pedidos_data:
-        pedido_data = pedido.get('pedido', {})
-        if not pedido_data:
-            logging.debug(f"Skipping empty pedido data: {pedido}")
-            continue
+    for pedido in pesquisa_data['retorno']['pedidos']:
+        pedido_data = pedido['pedido']
 
         pedido_data['data_pedido'] = transform_date_format(pedido_data.get('data_pedido', ''))
-        pedido_data['data_prevista'] = transform_date_format(pedido_data.get('data_prevista', ''))
+
+        data_prevista = pedido_data.get('data_prevista', '')
+        if data_prevista:
+            pedido_data['data_prevista'] = transform_date_format(data_prevista)
+        else:
+            del pedido_data['data_prevista']
+
         pedido_data.update({
             'uuid': uuid,
-            'timestamp': datetime.strptime(timestamp, "%Y-%m-%dT%H:%M:%S").isoformat(),
+            'timestamp': datetime.strptime(timestamp, "%Y%m%dT%H%M%S").isoformat(),
             'source_id': f"{SOURCE}-pesquisa_{VERSION}",
             'update_timestamp': datetime.utcnow().isoformat()
         })
 
-        table_ref = client.dataset(DATASET_ID).table('pesquisa'
-        errors = client.insert_rows_json(table_ref, [pedido_data])
-        if errors:
-            logging.error(f"Errors streaming data to BigQuery: {errors}")
-        else:
-            logging.info(f"Data streamed successfully to pesquisa.")
-            if NOTIFY:
-                publish_to_pubsub(uuid)
+        log_bigquery_reference(client, DATASET_ID, 'pesquisa')
+
+        table_ref = client.dataset(DATASET_ID).table('pesquisa')
+
+        insert_rows_with_retry(client, table_ref, [pedido_data])
+
+        if NOTIFY:
+            publish_to_pubsub(uuid)
+
+    logging.info("Pesquisa data transformation and loading completed.")
 
 
-def transform_and_load_produto_data(client: bigquery.Client, storage_client: storage.Client, bucket_name: str, filename: str, uuid: str, timestamp: str) -> None:
-    """
-    Transform and load Produto data into BigQuery.
+def transform_and_load_produto_data(client: bigquery.Client, produto_data: dict, uuid: str, timestamp: str) -> None:
+    logging.info("Transforming and loading Produto data.")
+    ensure_table_exists(client, 'produto', PRODUTO_SCHEMA)
 
-    Args:
-        client (bigquery.Client): The BigQuery client.
-        storage_client (storage.Client): The Google Cloud Storage client.
-        bucket_name (str): The name of the bucket containing the file.
-        filename (str): The name of the file to process.
-        uuid (str): The UUID of the produto.
-        timestamp (str): The timestamp of the produto.
-    """
-    bucket = storage_client.bucket(bucket_name)
-    blob = bucket.blob(filename)
-    json_content = json.loads(blob.download_as_text())
-    produto_data = json_content['retorno']['produto']
+    if not produto_data:
+        logging.debug("Received empty produto data.")
+        return
 
     produto_data.update({
         'uuid': uuid,
-        'timestamp': datetime.strptime(timestamp, "%Y-%m-%dT%H:%M:%S").isoformat(),
+        'timestamp': datetime.strptime(timestamp, "%Y%m%dT%H%M%S").isoformat(),
         'source_id': f"{SOURCE}-produto_{VERSION}",
         'update_timestamp': datetime.utcnow().isoformat()
     })
 
-    table_ref = client.dataset(DATASET_ID).table('produto'
-    errors = client.insert_rows_json(table_ref, [produto_data])
-    if errors:
-        logging.error(f"Errors streaming data to BigQuery: {errors}")
-    else:
-        logging.info(f"Data streamed successfully to produto.")
-        if NOTIFY:
-            publish_to_pubsub(uuid)
+    log_bigquery_reference(client, DATASET_ID, 'produto')
+
+    table_ref = client.dataset(DATASET_ID).table('produto')
+
+    insert_rows_with_retry(client, table_ref, [produto_data])
+
+    if NOTIFY:
+        publish_to_pubsub(uuid)
+
+    logging.info("Produto data transformation and loading completed.")
 
 
 def cloud_function_entry_point(event: dict, context: Any) -> None:
-    """
-    The entry point for the Cloud Function.
-
-    Args:
-        event (dict): The event payload.
-        context (Any): The event context.
-    """
+    logging.info(f"Cloud Function triggered by Pub/Sub message: {event}")
     client = bigquery.Client()
-    storage_client = storage.Client()
-    uuid, timestamp, product_type = parse_filename(event['name'])
-
-    if product_type == 'pdv':
-        ensure_table_exists(client, 'pdv', PDV_SCHEMA)
-        transform_and_load_pdv_data(client, storage_client, event['bucket'], event['name'], uuid, timestamp)
-    elif product_type == 'pesquisa':
-        ensure_table_exists(client, 'pesquisa', PESQUISA_SCHEMA)
-        transform_and_load_pesquisa_data(client, storage_client, event['bucket'], event['name'], uuid, timestamp)
-    elif product_type == 'produto':
-        ensure_table_exists(client, 'produto', PRODUTO_SCHEMA)
-        transform_and_load_produto_data(client, storage_client, event['bucket'], event['name'], uuid, timestamp)
-    else:
-        logging.warning(f"Unsupported product type: {product_type}. Skipping.")
+    message_data = base64.b64decode(event['data']).decode('utf-8')
+    message_json = json.loads(message_data)
+    uuid = message_json.get("uuid")
+    timestamp = message_json.get("timestamp")
+    if not uuid or not timestamp:
+        logging.error("UUID or Timestamp missing in Pub/Sub message.")
+        return
+    if "pdv_pedido_data" in message_json:
+        pdv_pedido_data = message_json["pdv_pedido_data"]
+        transform_and_load_pdv_data(client, pdv_pedido_data, uuid, timestamp)
+    if "produto_data" in message_json:
+        produto_data_list = message_json["produto_data"]
+        for produto_data in produto_data_list:
+            if "retorno" in produto_data and "produto" in produto_data["retorno"]:
+                transform_and_load_produto_data(client, produto_data["retorno"]["produto"], uuid, timestamp)
+    if "pedidos_pesquisa_data" in message_json:
+        pedidos_pesquisa_data = message_json["pedidos_pesquisa_data"]
+        transform_and_load_pesquisa_data(client, pedidos_pesquisa_data, uuid, timestamp)
+    logging.info("Processing completed for Pub/Sub message.")

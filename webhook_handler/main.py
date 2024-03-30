@@ -1,26 +1,31 @@
 import json
-import google.cloud.storage as storage
+import os
+import logging
+import sys
 from datetime import datetime, timezone
 import uuid
 from flask import abort, make_response, jsonify
+from google.cloud import storage
 from tenacity import retry, wait_exponential, stop_after_attempt, before_log
-import logging
-import sys
 
-BUCKET_NAME = "z316-tiny-webhook"
-FILENAME_FORMAT = "vendas/z316-tiny-webhook-vendas-{dados_id}-{timestamp}-{unique_id}.json"
+BUCKET_NAME = os.getenv("BUCKET_NAME")
+FILENAME_FORMAT = os.getenv("FILENAME_FORMAT")
 
 logger = logging.getLogger()
 logging.basicConfig(stream=sys.stdout, level=logging.INFO)
 
 storage_client = storage.Client()
 
-@retry(wait=wait_exponential(multiplier=1, max=10), stop=stop_after_attempt(3), before=before_log(logger, logging.DEBUG))
+@retry(wait=wait_exponential(multiplier=1, max=10),
+       stop=stop_after_attempt(3),
+       before=before_log(logger, logging.DEBUG))
 def upload_to_gcs(blob, data):
+    """Upload data to Google Cloud Storage."""
     blob.upload_from_string(data, content_type='application/json')
     logger.info(f"Successfully uploaded {blob.name}")
 
 def validate_payload(request_data):
+    """Validate the incoming request payload."""
     required_fields = ["versao", "cnpj", "tipo", "dados"]
     if not all(field in request_data for field in required_fields):
         raise ValueError("Payload missing required fields")
@@ -28,9 +33,13 @@ def validate_payload(request_data):
         raise ValueError("Payload 'tipo' is not 'inclusao_pedido'")
 
 def generate_filename(dados_id, timestamp, unique_id):
-    return FILENAME_FORMAT.format(dados_id=dados_id, timestamp=timestamp, unique_id=unique_id)
+    """Generate a filename for the storage blob."""
+    return FILENAME_FORMAT.format(dados_id=dados_id,
+                                   timestamp=timestamp,
+                                   unique_id=unique_id)
 
 def erp_webhook_handler(request):
+    """Handle incoming webhook requests."""
     if request.method != 'POST':
         return make_response('Method not allowed', 405)
 
