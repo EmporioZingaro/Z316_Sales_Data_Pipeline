@@ -4,7 +4,7 @@ import uuid
 import hashlib
 import time
 from datetime import datetime
-from google.cloud import storage, secretmanager
+from google.cloud import storage, secretmanager, pubsub_v1
 from tenacity import retry, wait_exponential, stop_after_attempt, retry_if_exception_type
 
 BASE_URL = "https://api.tiny.com.br/api2/"
@@ -16,6 +16,8 @@ PESQUISA_FILENAME = "{dados_id}-pesquisa-{timestamp}-{uuid_str}"
 PRODUTO_FILENAME = "{dados_id}-produto-{produto_id}-{timestamp}-{uuid_str}"
 SECRET_PATH = "projects/559935551835/secrets/z316-tiny-token-api/versions/latest"
 SLEEP_TIME = 3
+PUBSUB_TOPIC = 'projects/emporio-zingaro/topics/api-to-gcs_DONE'
+SLEEP_INTERVAL = 0.2
 
 PROJECT_ID = "z316-sales-data-pipeline"
 SOURCE_IDENTIFIER = "backfill"
@@ -23,6 +25,7 @@ VERSION_CONTROL = "git_commit_id"
 
 storage_client = storage.Client()
 secret_manager_client = secretmanager.SecretManagerServiceClient()
+pubsub_publisher = pubsub_v1.PublisherClient()
 
 class ValidationError(Exception):
     pass
@@ -145,6 +148,29 @@ def fetch_produto_data(item_id, token):
 def fetch_pedidos_pesquisa_data(pedido_numero, token):
     return make_api_call(f"{BASE_URL}pedidos.pesquisa.php?token={token}&numero={pedido_numero}&formato=JSON")
 
+def create_pubsub_message(pdv_pedido_data, produto_data, pedidos_pesquisa_data, timestamp, uuid):
+    message = {
+        "pdv_pedido_data": pdv_pedido_data,
+        "produto_data": produto_data,
+        "pedidos_pesquisa_data": pedidos_pesquisa_data,
+        "nota_fiscal_link_data": {"retorno": {"status_processamento": "3", "status": "OK", "link_nfe": ""}},
+        "timestamp": timestamp,
+        "uuid": uuid
+    }
+    print_message(f"Pub/Sub message created: {message}", context="create_pubsub_message")
+    return message
+
+def publish_message(topic_name, message):
+    try:
+        serialized_message = json.dumps(message, ensure_ascii=False)
+        payload = serialized_message.encode('utf-8')
+        future = pubsub_publisher.publish(topic_name, data=payload)
+        future.result()
+        print_message(f"Notification published to {topic_name} with message: {serialized_message}", context="publish_message")
+        time.sleep(SLEEP_INTERVAL)
+    except Exception as e:
+        print_message(f"Failed to publish notification: {e}", context="publish_message")
+
 def process_pdv_pedido_data(dados_id, timestamp, uuid_str, token, folder_path):
     pdv_pedido_data = fetch_pdv_pedido_data(dados_id, token)
     pedido_numero = pdv_pedido_data.get('retorno', {}).get('pedido', {}).get('numero')
@@ -155,18 +181,20 @@ def process_pdv_pedido_data(dados_id, timestamp, uuid_str, token, folder_path):
         'data_type': 'pdv.pedido'
     })
 
+    produto_data = []
     for item in pdv_pedido_data.get('retorno', {}).get('pedido', {}).get('itens', []):
         item_id = item.get('idProduto')
         if item_id:
-            produto_data = fetch_produto_data(item_id, token)
-            store_payload(produto_data, PRODUTO_FILENAME.format(dados_id=dados_id, produto_id=item_id, timestamp=timestamp, uuid_str=uuid_str), folder_path, {
+            produto_item_data = fetch_produto_data(item_id, token)
+            store_payload(produto_item_data, PRODUTO_FILENAME.format(dados_id=dados_id, produto_id=item_id, timestamp=timestamp, uuid_str=uuid_str), folder_path, {
                 'uuid_str': uuid_str,
                 'pedido_id': pedido_numero,
                 'produto_id': item_id,
                 'data_type': 'produto'
             })
+            produto_data.append(produto_item_data)
 
-    return pedido_numero
+    return pedido_numero, pdv_pedido_data, produto_data
 
 def process_pedidos_pesquisa_data(dados_id, timestamp, uuid_str, token, pedido_numero, folder_path):
     pedidos_data = fetch_pedidos_pesquisa_data(pedido_numero, token)
@@ -177,6 +205,8 @@ def process_pedidos_pesquisa_data(dados_id, timestamp, uuid_str, token, pedido_n
         'data_type': 'pedidos.pesquisa'
     })
 
+    return pedidos_data
+
 def process_pedido(pedido, all_processed_dados_ids, token):
     dados_id, data_pedido, pedido_numero = pedido['id'], pedido['data_pedido'], pedido['numero']
 
@@ -186,8 +216,11 @@ def process_pedido(pedido, all_processed_dados_ids, token):
             timestamp, uuid_str = generate_timestamp_and_uuid(data_pedido)
             folder_path = FOLDER_NAME.format(timestamp=timestamp, dados_id=dados_id, uuid_str=uuid_str)
 
-            pedido_numero = process_pdv_pedido_data(dados_id, timestamp, uuid_str, token, folder_path)
-            process_pedidos_pesquisa_data(dados_id, timestamp, uuid_str, token, pedido_numero, folder_path)
+            pedido_numero, pdv_pedido_data, produto_data = process_pdv_pedido_data(dados_id, timestamp, uuid_str, token, folder_path)
+            pedidos_pesquisa_data = process_pedidos_pesquisa_data(dados_id, timestamp, uuid_str, token, pedido_numero, folder_path)
+
+            pubsub_message = create_pubsub_message(pdv_pedido_data, produto_data, pedidos_pesquisa_data, timestamp, uuid_str)
+            publish_message(PUBSUB_TOPIC, pubsub_message)
 
             all_processed_dados_ids.add(dados_id)
         else:
