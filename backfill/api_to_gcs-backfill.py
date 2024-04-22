@@ -153,7 +153,7 @@ def create_pubsub_message(pdv_pedido_data, produto_data, pedidos_pesquisa_data, 
         "pdv_pedido_data": pdv_pedido_data,
         "produto_data": produto_data,
         "pedidos_pesquisa_data": pedidos_pesquisa_data,
-        "nota_fiscal_link_data": {"retorno": {"status_processamento": "3", "status": "OK", "link_nfe": ""}},
+        "nota_fiscal_link_data": "",
         "timestamp": timestamp,
         "uuid": uuid
     }
@@ -170,42 +170,49 @@ def publish_message(topic_name, message):
         time.sleep(SLEEP_INTERVAL)
     except Exception as e:
         print_message(f"Failed to publish notification: {e}", context="publish_message")
+        raise
 
 def process_pdv_pedido_data(dados_id, timestamp, uuid_str, token, folder_path):
-    pdv_pedido_data = fetch_pdv_pedido_data(dados_id, token)
-    pedido_numero = pdv_pedido_data.get('retorno', {}).get('pedido', {}).get('numero')
+    try:
+        pdv_pedido_data = fetch_pdv_pedido_data(dados_id, token)
+        pedido_numero = pdv_pedido_data.get('retorno', {}).get('pedido', {}).get('numero')
 
-    store_payload(pdv_pedido_data, PDV_FILENAME.format(dados_id=dados_id, timestamp=timestamp, uuid_str=uuid_str), folder_path, {
-        'uuid_str': uuid_str,
-        'pedido_id': pedido_numero,
-        'data_type': 'pdv.pedido'
-    })
+        store_payload(pdv_pedido_data, PDV_FILENAME.format(dados_id=dados_id, timestamp=timestamp, uuid_str=uuid_str), folder_path, {
+            'uuid_str': uuid_str,
+            'pedido_id': pedido_numero,
+            'data_type': 'pdv.pedido'
+        })
 
-    produto_data = []
-    for item in pdv_pedido_data.get('retorno', {}).get('pedido', {}).get('itens', []):
-        item_id = item.get('idProduto')
-        if item_id:
-            produto_item_data = fetch_produto_data(item_id, token)
-            store_payload(produto_item_data, PRODUTO_FILENAME.format(dados_id=dados_id, produto_id=item_id, timestamp=timestamp, uuid_str=uuid_str), folder_path, {
-                'uuid_str': uuid_str,
-                'pedido_id': pedido_numero,
-                'produto_id': item_id,
-                'data_type': 'produto'
-            })
-            produto_data.append(produto_item_data)
+        produto_data = []
+        for item in pdv_pedido_data.get('retorno', {}).get('pedido', {}).get('itens', []):
+            item_id = item.get('idProduto')
+            if item_id:
+                produto_item_data = fetch_produto_data(item_id, token)
+                store_payload(produto_item_data, PRODUTO_FILENAME.format(dados_id=dados_id, produto_id=item_id, timestamp=timestamp, uuid_str=uuid_str), folder_path, {
+                    'uuid_str': uuid_str,
+                    'pedido_id': pedido_numero,
+                    'produto_id': item_id,
+                    'data_type': 'produto'
+                })
+                produto_data.append(produto_item_data)
 
-    return pedido_numero, pdv_pedido_data, produto_data
+        return pedido_numero, pdv_pedido_data, produto_data
+    except Exception as e:
+        print_message(f"Failed to fetch or process PDV pedido data: {e}", context="process_pdv_pedido_data")
+        return None, None, None
 
 def process_pedidos_pesquisa_data(dados_id, timestamp, uuid_str, token, pedido_numero, folder_path):
-    pedidos_data = fetch_pedidos_pesquisa_data(pedido_numero, token)
-
-    store_payload(pedidos_data, PESQUISA_FILENAME.format(dados_id=dados_id, timestamp=timestamp, uuid_str=uuid_str), folder_path, {
-        'uuid_str': uuid_str,
-        'pedido_id': pedido_numero,
-        'data_type': 'pedidos.pesquisa'
-    })
-
-    return pedidos_data
+    try:
+        pedidos_data = fetch_pedidos_pesquisa_data(pedido_numero, token)
+        store_payload(pedidos_data, PESQUISA_FILENAME.format(dados_id=dados_id, timestamp=timestamp, uuid_str=uuid_str), folder_path, {
+            'uuid_str': uuid_str,
+            'pedido_id': pedido_numero,
+            'data_type': 'pedidos.pesquisa'
+        })
+        return pedidos_data
+    except Exception as e:
+        print_message(f"Failed to fetch or process pedidos pesquisa data: {e}", context="process_pedidos_pesquisa_data")
+        return None
 
 def process_pedido(pedido, all_processed_dados_ids, token):
     dados_id, data_pedido, pedido_numero = pedido['id'], pedido['data_pedido'], pedido['numero']
@@ -217,12 +224,16 @@ def process_pedido(pedido, all_processed_dados_ids, token):
             folder_path = FOLDER_NAME.format(timestamp=timestamp, dados_id=dados_id, uuid_str=uuid_str)
 
             pedido_numero, pdv_pedido_data, produto_data = process_pdv_pedido_data(dados_id, timestamp, uuid_str, token, folder_path)
-            pedidos_pesquisa_data = process_pedidos_pesquisa_data(dados_id, timestamp, uuid_str, token, pedido_numero, folder_path)
-
-            pubsub_message = create_pubsub_message(pdv_pedido_data, produto_data, pedidos_pesquisa_data, timestamp, uuid_str)
-            publish_message(PUBSUB_TOPIC, pubsub_message)
-
-            all_processed_dados_ids.add(dados_id)
+            if pedido_numero and pdv_pedido_data and produto_data:
+                pedidos_pesquisa_data = process_pedidos_pesquisa_data(dados_id, timestamp, uuid_str, token, pedido_numero, folder_path)
+                if pedidos_pesquisa_data:
+                    pubsub_message = create_pubsub_message(pdv_pedido_data, produto_data, pedidos_pesquisa_data, timestamp, uuid_str)
+                    publish_message(PUBSUB_TOPIC, pubsub_message)
+                    all_processed_dados_ids.add(dados_id)
+                else:
+                    print_message(f"Skipping Pub/Sub message for Pedido {dados_id} due to missing pedidos pesquisa data.")
+            else:
+                print_message(f"Skipping Pub/Sub message for Pedido {dados_id} due to missing PDV pedido or produto data.")
         else:
             print_message(f"Pedido {dados_id} confirmed processed on just-in-time check. Skipping.")
     else:
